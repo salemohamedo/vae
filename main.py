@@ -31,7 +31,8 @@ def prepare_dataloaders(dataset: str = 'mnist') -> Tuple[DataLoader, DataLoader]
                                       train=False)
     else:
         raise ValueError(f"Dataset: {dataset} not supported!")
-        
+    
+    train_dataset.data = train_dataset.data[:2]
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
     return train_loader, val_loader
@@ -72,25 +73,28 @@ class Decoder(nn.Module):
         self.decoder = nn.Sequential(*layers)
 
     def forward(self, z: torch.Tensor):
-        return self.decoder(z)
+        out = self.decoder(z)
+        return out.unflatten(-1, (1, 28, 28))
         
 class VAE(nn.Module):
-    def __init__(self, x_dims: int, z_dims: int, hidden_dims: list = [128, 64, 36, 18]):
+    def __init__(self, x_dims: int, z_dims: int, hidden_dims: list = [128, 64, 36, 18]) -> None:
         super().__init__()
         self.encoder = Encoder(x_dims, z_dims, hidden_dims)
         self.decoder = Decoder(x_dims, z_dims, hidden_dims[::-1])
         self.z_dims = z_dims
         self.normal = torch.distributions.Normal(0, 1)
 
-    def forward(self, x: torch.Tensor):
+    def reparameterize(self, means: torch.Tensor, log_vars: torch.Tensor) -> torch.Tensor:
+        eps = self.normal.sample(log_vars.shape).to(device)
+        vars = torch.exp(log_vars)
+        std = vars.sqrt()
+        self.kl = (-0.5)*(log_vars - vars - means**2 + 1).sum()
+        return means + std*eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         means, log_vars = self.encoder(x)
         z = self.reparameterize(means, log_vars)
         return self.decoder(z)
-    
-    def reparameterize(self, means: torch.Tensor, log_vars: torch.Tensor):
-        eps = self.normal.sample(log_vars.shape)
-        std = torch.exp(log_vars)
-        return means + std*eps
 
 class VAELoss(nn.Module):
     def __init__(self) -> None:
@@ -102,9 +106,11 @@ class VAELoss(nn.Module):
 def train(model: VAE, train_loader: DataLoader, criterion: VAELoss, optim: torch.optim.Optimizer) -> None:
     model.train()
     for x, _ in train_loader:
+        x = x.to(device)
         optim.zero_grad()
-        x_pred, kl = model(x)
-        loss = criterion(x_pred, x, kl)
+        x_pred = model(x)
+        loss = criterion(x_pred, x, model.kl)
+        print(loss)
         loss.backward()
         optim.step()
 
@@ -113,19 +119,20 @@ def eval(model: VAE, val_loader: DataLoader, criterion: VAELoss) -> torch.Tensor
     model.eval()
     total_loss = 0
     for x, _ in val_loader:
-        x_pred, kl = model(x)
-        loss = criterion(x_pred, x, kl)
+        x = x.to(device)
+        x_pred = model(x)
+        loss = criterion(x_pred, x, model.kl)
         total_loss += loss
     return total_loss / len(val_loader)
 
 train_loader, val_loader = prepare_dataloaders(args.dataset)
 
-vae = VAE(x_dims=784, z_dims=args.latent_dims).to(device)
+vae = VAE(x_dims=784, z_dims=args.latent_size).to(device)
 optim = torch.optim.Adam(vae.parameters(), lr=args.lr)
 criterion = VAELoss()
 
 for i in range(args.num_epochs):
     train(vae, train_loader, criterion, optim)
-    val_loss = eval(vae, val_loader, criterion)
-    print(f"Eval loss: {val_loss:.4f}")
+    # val_loss = eval(vae, val_loader, criterion)
+    # print(f"Eval loss: {val_loss:.4f}")
 
